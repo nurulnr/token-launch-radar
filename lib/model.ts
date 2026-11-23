@@ -1,11 +1,11 @@
-// Radar Zero — the value model.
+// Radar Zero, round 2 — value model, eligibility and farm plans.
 //
-// A protocol with no token yet is worth what its locked value would be worth
-// if it had one. The model below is the whole ranking: four multipliers on
-// TVL, nothing else, and every farm plan is built from the protocol's own
-// category, chain and size. No protocol name is special-cased anywhere.
+// Everything in this file derives from the sealed snapshot alone. There is
+// no list of names kept by hand and no outside data: the snapshot's own
+// figures (TVL, seven-day change, tracking start, chain count) decide the
+// ranking, the set-aside list and every farm step.
 
-export interface SnapshotProtocol {
+export interface Protocol {
   slug: string;
   name: string;
   category: string | null;
@@ -20,64 +20,79 @@ export interface SnapshotProtocol {
 
 export interface Snapshot {
   as_of: string;
+  source: string;
   floor_usd: number;
-  protocols: SnapshotProtocol[];
+  protocols: Protocol[];
   watchlist: string[];
 }
 
-export interface ScoredProtocol {
+export interface RankedRow {
   slug: string;
   name: string;
   category: string | null;
-  chains: string[];
-  tvl: number;
-  change7d: number | null;
-  ageYears: number;
-  growthMult: number;
-  ageMult: number;
-  chainMult: number;
-  implied: number;
-  farmSteps: string[];
-  preToken: boolean;
-  setAside: string | null;
-  mcap: number | null;
-  symbol: string | null;
-}
-
-export interface BoardRow {
-  slug: string;
-  name: string;
-  rank: number;
+  chain: string;
+  chains: number;
+  tvl_usd: number;
+  change_7d: number | null;
+  listed_at: string | null;
+  age_years: number;
+  growth_mult: number;
+  age_mult: number;
+  chain_mult: number;
   implied_value_usd: number;
+  rank: number;
   farm_steps: string[];
 }
 
-export interface BuiltBoard {
+export interface SetAsideRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  reason: string;
+}
+
+export interface TokenRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  change_7d: number | null;
+  chains: number;
+}
+
+export interface BreakdownEntry {
+  key: string;
+  total: number;
+  count: number;
+}
+
+export interface Board {
   asOf: string;
   floorUsd: number;
-  watchlist: string[];
-  rows: BoardRow[];
-  scored: ScoredProtocol[];
-  live: ScoredProtocol[];
-  setAside: { slug: string; name: string; category: string | null; tvl: number; reason: string }[];
+  ranked: RankedRow[];
+  setAside: SetAsideRow[];
+  tokenTrading: TokenRow[];
+  chains: BreakdownEntry[];
+  categories: BreakdownEntry[];
+  totalImplied: number;
 }
 
-/** A protocol is pre-token when the snapshot records no token for it at all. */
-export function isPreToken(p: SnapshotProtocol): boolean {
-  return p.gecko_id === null && p.symbol === null;
-}
+// ---------------------------------------------------------------- constants
 
-/**
- * The house's own watchlist rule, without its $50M floor: a launch radar
- * ranks protocols that could issue a token, not an exchange, not a bridge,
- * not a liquid-staking or restaked product of a token that already trades,
- * not a wrapped or staked product, and not a version fork. The rule is the
- * one the competition publishes for its watchlist, applied to every
- * pre-token protocol instead of only the ones above the floor — so the
- * board's top is genuine launch candidates, and the giants it sets aside
- * are listed on the page with their reason, not hidden.
- */
-const OUT_CATEGORIES = new Set([
+const DAYS_PER_YEAR = 365.25;
+const GROWTH_LOW = -40;
+const GROWTH_HIGH = 150;
+const AGE_RATE = 0.12;
+const AGE_CAP_YEARS = 4;
+const CHAIN_RATE = 0.04;
+const CHAIN_CAP = 6;
+
+// Categories the house rule keeps off the launch board: a centralised
+// exchange, a bridge, or a wrapped, staked or restaked product of a token
+// that already trades. A protocol in one of these records no token of its
+// own to launch, so it is set aside, never ranked.
+const EXCLUDED_CATEGORIES = new Set([
   'Bridge',
   'Canonical Bridge',
   'Liquid Staking',
@@ -85,402 +100,615 @@ const OUT_CATEGORIES = new Set([
   'Restaked BTC',
   'CEX',
 ]);
-const EXCHANGE_NAMES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
-const VERSION_SUFFIX = /\s(V1|v1|1\.0|V2|v2|2\.0|V3|v3|3\.0|V4|v4|4\.0)$/;
+
+// An exchange name at the start of a protocol's name.
+const EXCHANGE_PREFIX =
+  /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
+
+// A whole word wrapped, staked or staking anywhere in the name.
 const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
 
-/** Why a pre-token protocol is set aside from the ranked board, or null. */
-export function setAsideReason(p: SnapshotProtocol): string | null {
-  if (!isPreToken(p)) return 'token trades';
-  if (p.category !== null && OUT_CATEGORIES.has(p.category)) {
-    return `${p.category} — a product of a token that already trades`;
+// A version marker at the end of the name: a space, then V or v with one
+// digit (V1, V2, V3), optionally with a point release, or a dotted number
+// (2.0). Two-digit versions such as V12 are not markers under this rule.
+const VERSION_SUFFIX = /\s+[Vv][1-9](\.\d+)?$|\s+\d+\.\d+$/;
+
+// ---------------------------------------------------------------- the model
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
+}
+
+// How long the protocol has run, in years, from the day DefiLlama began
+// tracking it to the snapshot's date. No start date on record means no age
+// is claimed: zero years.
+export function ageYears(listedAt: string | null, asOf: string): number {
+  if (!listedAt) return 0;
+  const start = Date.parse(listedAt + 'T00:00:00Z');
+  const end = Date.parse(asOf + 'T00:00:00Z');
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return 0;
+  return (end - start) / 86400000 / DAYS_PER_YEAR;
+}
+
+// The growth multiplier: the seven-day TVL change in per cent, clamped to
+// the range the model trusts, turned into a multiplier. No change reported
+// means no growth is claimed: a neutral 1.
+export function growthMult(change7d: number | null): number {
+  if (change7d === null || change7d === undefined) return 1;
+  return 1 + clamp(change7d, GROWTH_LOW, GROWTH_HIGH) / 100;
+}
+
+// The age multiplier: a protocol that has run longer with no token earns
+// more, up to four years of credit.
+export function ageMult(years: number): number {
+  return 1 + AGE_RATE * Math.min(years, AGE_CAP_YEARS);
+}
+
+// The chain multiplier: a protocol live on more chains earns more, up to
+// six chains of credit.
+export function chainMult(chainCount: number): number {
+  return 1 + CHAIN_RATE * Math.min(chainCount, CHAIN_CAP);
+}
+
+// The implied value: what the protocol's token would be worth if its record
+// stayed as it is. TVL is the base; growth, age and chain count multiply
+// it. The result is a whole number of dollars.
+export function impliedValue(p: Protocol, asOf: string): number {
+  const years = ageYears(p.listed_at, asOf);
+  const value =
+    p.tvl_usd *
+    growthMult(p.change_7d) *
+    ageMult(years) *
+    chainMult(p.chains.length);
+  return Math.round(value);
+}
+
+// ---------------------------------------------------------------- eligibility
+
+// Why a pre-token protocol is set aside instead of ranked, or null when it
+// is a launch candidate. The rule is the house watchlist rule with the
+// $50,000,000 floor taken off: the floor is never the whole board, so a
+// smaller protocol with the same shape is just as much a candidate.
+export function setAsideReason(p: Protocol): string | null {
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) {
+    return 'Excluded category: ' + p.category;
   }
-  if (VERSION_SUFFIX.test(p.name)) return 'version fork of a protocol';
-  if (WRAPPED_WORD.test(p.name)) return 'wrapped or staked product';
-  if (EXCHANGE_NAMES.some((e) => p.name.startsWith(e))) return 'exchange product';
+  if (EXCHANGE_PREFIX.test(p.name)) {
+    return 'Exchange-branded name';
+  }
+  if (WRAPPED_WORD.test(p.name)) {
+    return 'Wrapped or staked product';
+  }
+  if (VERSION_SUFFIX.test(p.name)) {
+    return 'Versioned release';
+  }
   return null;
 }
 
-/** A launch candidate: pre-token and not set aside by the rule above. */
-export function isLaunchCandidate(p: SnapshotProtocol): boolean {
-  return setAsideReason(p) === null;
+function recordsNoToken(p: Protocol): boolean {
+  return p.gecko_id === null && p.symbol === null;
 }
 
-function clamp(x: number, lo: number, hi: number): number {
-  return x < lo ? lo : x > hi ? hi : x;
+// ---------------------------------------------------------------- formatting
+
+export function formatUsd(value: number): string {
+  if (value >= 1e9) return '$' + (value / 1e9).toFixed(2) + 'B';
+  if (value >= 1e6) return '$' + (value / 1e6).toFixed(1) + 'M';
+  if (value >= 1e3) return '$' + (value / 1e3).toFixed(1) + 'K';
+  return '$' + String(Math.round(value));
 }
 
-/** Years between the snapshot date and a listing date; 0 when unlisted. */
-export function ageYears(asOf: string, listedAt: string | null): number {
-  if (!listedAt) return 0;
-  const asOfMs = Date.parse(asOf + 'T00:00:00Z');
-  const listedMs = Date.parse(listedAt + 'T00:00:00Z');
-  if (!Number.isFinite(asOfMs) || !Number.isFinite(listedMs)) return 0;
-  const days = (asOfMs - listedMs) / 86400000;
-  return days <= 0 ? 0 : days / 365.25;
+export function formatMoney(value: number): string {
+  return '$' + String(Math.round(value));
 }
 
-/**
- * The four multipliers of the model, exactly as stated on the dashboard:
- * growth  = 1 + clamp(7d change %, -40, 150) / 100
- * age     = 1 + 0.12 * min(age in years, 4)
- * chains  = 1 + 0.04 * min(number of chains, 6)
- * implied = round(TVL * growth * age * chains), at least $1.
- */
-export function multipliers(p: SnapshotProtocol, asOf: string): {
-  ageYears: number;
-  growthMult: number;
-  ageMult: number;
-  chainMult: number;
-  implied: number;
-} {
-  const age = ageYears(asOf, p.listed_at);
-  const growthMult = 1 + clamp(p.change_7d ?? 0, -40, 150) / 100;
-  const ageMult = 1 + 0.12 * Math.min(age, 4);
-  const chainMult = 1 + 0.04 * Math.min((p.chains ?? []).length, 6);
-  const implied = Math.max(1, Math.round(p.tvl_usd * growthMult * ageMult * chainMult));
-  return { ageYears: age, growthMult, ageMult, chainMult, implied };
+export function formatMult(value: number): string {
+  return 'x' + value.toFixed(2);
+}
+
+export function formatAge(years: number): string {
+  if (years < 1) {
+    const months = Math.max(1, Math.round(years * 12));
+    return months === 1 ? '1 month' : months + ' months';
+  }
+  const rounded = Math.round(years * 10) / 10;
+  return rounded === 1 ? '1 year' : rounded + ' years';
+}
+
+export function formatPct(change: number): string {
+  return Math.abs(change).toFixed(1) + '%';
 }
 
 // ---------------------------------------------------------------- farm plans
 
-/** FNV-1a over a slug: the only source of per-row variety, fully deterministic. */
-export function hashSlug(slug: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < slug.length; i++) {
-    h ^= slug.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
+// A reader's position size follows the protocol's TVL band: a bigger
+// protocol supports a bigger position, and no step asks for more than the
+// band allows.
+function positionSize(tvl: number): number {
+  if (tvl < 25_000_000) return 100;
+  if (tvl < 100_000_000) return 250;
+  if (tvl < 500_000_000) return 500;
+  if (tvl < 2_000_000_000) return 1000;
+  return 2000;
+}
+
+// A top-up is a quarter of the position, rounded to the nearest five.
+function topUp(amount: number): number {
+  return Math.max(5, Math.round(amount / 4 / 5) * 5);
+}
+
+// How long to hold, from the protocol's age: older protocols reward a
+// longer hold.
+function holdDays(years: number): number {
+  if (years < 1) return 30;
+  if (years < 2) return 45;
+  if (years < 4) return 60;
+  return 90;
+}
+
+// Rough gas for one transaction on a chain, in whole dollars. Estimates
+// only; every step says "about".
+const GAS_BY_CHAIN: Record<string, number> = {
+  Ethereum: 8,
+  Arbitrum: 0.5,
+  Base: 0.3,
+  Solana: 0.05,
+  Binance: 0.3,
+  'BNB Chain': 0.3,
+  Polygon: 0.1,
+  Optimism: 0.4,
+  Avalanche: 0.5,
+  Gnosis: 0.3,
+  Fantom: 0.2,
+  Linea: 0.3,
+  zkSync: 0.4,
+  Scroll: 0.3,
+  Blast: 0.3,
+  Mode: 0.2,
+  Sei: 0.05,
+  Sui: 0.05,
+  Aptos: 0.05,
+  Near: 0.05,
+  Cosmos: 0.1,
+  Cronos: 0.2,
+  Mantle: 0.2,
+  Berachain: 0.3,
+  Sonic: 0.2,
+  Hyperliquid: 0.05,
+  Unichain: 0.3,
+  Katana: 0.3,
+  Monad: 0.1,
+  Arc: 0.3,
+  Corn: 0.3,
+  'Robinhood Chain': 0.3,
+  'Plume Mainnet': 0.2,
+  Pharos: 0.2,
+  Citrea: 0.3,
+  Etherlink: 0.3,
+  Ink: 0.3,
+  Abstract: 0.3,
+  Story: 0.3,
+  MegaETH: 0.2,
+};
+
+function gasOn(chain: string): string {
+  const gas = GAS_BY_CHAIN[chain] ?? 1;
+  if (gas >= 1) return '$' + String(gas);
+  return '$' + gas.toFixed(2);
+}
+
+function formatGasAmount(chain: string): string {
+  return 'about ' + gasOn(chain) + ' in gas';
+}
+
+// The three actions of a farm plan depend on what the protocol is: a DEX is
+// farmed by swapping and adding liquidity, a lender by supplying, a vault
+// by depositing, and so on. Each family states its entry, its core position
+// and its weekly cadence in its own words.
+interface Family {
+  entry: (name: string, chain: string, amount: string, gas: string) => string;
+  core: (
+    name: string,
+    chain: string,
+    amount: string,
+    gas: string,
+    hold: number,
+  ) => string;
+  repeat: (
+    name: string,
+    chain: string,
+    small: string,
+    gas: string,
+  ) => string;
+}
+
+const FAMILIES: Record<string, Family> = {
+  Dexs: {
+    entry: (n, c, a, g) =>
+      `Swap ${a} through ${n}'s pools on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Add ${a} of liquidity to ${n}'s deepest pool on ${c} and leave it earning for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Swap a small trade on ${n} once a week for 8 weeks so the wallet shows steady use (about ${g} a week, 8 weeks).`,
+  },
+  Lending: {
+    entry: (n, c, a, g) =>
+      `Supply ${a} of stablecoins to ${n} on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} supplied on ${n} for ${h} days and let the interest build (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Top up the supply by ${s} every two weeks for 8 weeks (about ${g} each time, 8 weeks).`,
+  },
+  Yield: {
+    entry: (n, c, a, g) =>
+      `Deposit ${a} into ${n}'s vault on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Keep ${a} in ${n}'s vault on ${c} for ${h} days and let it compound (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Compound the yield back into the vault once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  'Yield Aggregator': {
+    entry: (n, c, a, g) =>
+      `Deposit ${a} into ${n}'s vault on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Keep ${a} in ${n}'s best vault on ${c} for ${h} days and let it compound (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Compound the yield back into the vault once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  RWA: {
+    entry: (n, c, a, g) =>
+      `Buy ${a} of ${n}'s tokenised assets on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Hold ${a} of ${n}'s tokenised assets for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Reinvest the yield into ${n} once a month for 2 months (about ${g} each time, 8 weeks).`,
+  },
+  'Risk Curators': {
+    entry: (n, c, a, g) =>
+      `Allocate ${a} to ${n}'s curated vault on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Keep ${a} allocated with ${n}'s curator on ${c} for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Review the curator's allocations once a month and rebalance by ${s} (about ${g} each time, 8 weeks).`,
+  },
+  'Onchain Capital Allocator': {
+    entry: (n, c, a, g) =>
+      `Allocate ${a} to ${n}'s curated vault on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Keep ${a} allocated with ${n}'s best-performing curator on ${c} for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Review the curator's allocations once a month and rebalance by ${s} (about ${g} each time, 8 weeks).`,
+  },
+  Derivatives: {
+    entry: (n, c, a, g) =>
+      `Open a ${a} hedged position on ${n} on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Hold a ${a} hedged position on ${n} for ${h} days and keep collateral above the liquidation line (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Rebalance the hedge once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  'Basis Trading': {
+    entry: (n, c, a, g) =>
+      `Open a ${a} hedged position on ${n} on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Hold a ${a} basis position on ${n} for ${h} days and keep collateral above the liquidation line (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Rebalance the basis position once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  CDP: {
+    entry: (n, c, a, g) =>
+      `Lock ${a} of collateral to mint ${n}'s stablecoin on ${c} (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} of collateral locked with ${n} for ${h} days and the ratio above 150% (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Top up collateral by ${s} whenever the ratio nears 150% over the next 8 weeks (about ${g} each time, 8 weeks).`,
+  },
+  Farm: {
+    entry: (n, c, a, g) =>
+      `Stake ${a} in ${n}'s farm on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} staked in ${n}'s farm for ${h} days and harvest weekly (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Harvest the rewards and re-stake them once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  'Liquidity Manager': {
+    entry: (n, c, a, g) =>
+      `Deposit ${a} into ${n}'s managed liquidity on ${c} (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Keep ${a} in ${n}'s managed range on ${c} for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Let the manager rebalance weekly and check the range once a month for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  Chain: {
+    entry: (n, c, a, g) =>
+      `Bridge ${a} to ${c} and use ${n}'s apps to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Use ${n}'s native apps weekly with ${a} on the chain for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Do one on-chain action on ${n} every week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  'Anchor BTC': {
+    entry: (n, c, a, g) =>
+      `Mint ${a} of ${n}'s BTC-backed asset on ${c} (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Hold ${a} of ${n}'s BTC-backed asset for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Add ${s} to the position once a month for 2 months (about ${g} each time, 8 weeks).`,
+  },
+  'Decentralized BTC': {
+    entry: (n, c, a, g) =>
+      `Mint ${a} of ${n}'s BTC-backed asset on ${c} (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Hold ${a} of ${n}'s BTC-backed asset for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Add ${s} to the position once a month for 2 months (about ${g} each time, 8 weeks).`,
+  },
+  CeDeFi: {
+    entry: (n, c, a, g) =>
+      `Deposit ${a} with ${n} on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} deposited with ${n} for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, s, g) =>
+      `Check the yield and top up by ${s} monthly for 2 months (about ${g} each time, 8 weeks).`,
+  },
+  'Options Vault': {
+    entry: (n, c, a, g) =>
+      `Deposit ${a} into ${n}'s options vault on ${c} (${g}, about 10 minutes).`,
+    core: (n, c, a, g, h) =>
+      `Keep ${a} in ${n}'s options vault through the full epoch of ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Roll the vault position at each epoch end over the next 8 weeks (about ${g} each time, 8 weeks).`,
+  },
+  Privacy: {
+    entry: (n, c, a, g) =>
+      `Use ${n}'s private pools on ${c} with ${a} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} in ${n}'s private pools for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Rotate the private pool position once a month for 2 months (about ${g} each time, 8 weeks).`,
+  },
+  'Leveraged Farming': {
+    entry: (n, c, a, g) =>
+      `Open a ${a} leveraged farm on ${n} on ${c} (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Hold a ${a} leveraged farm on ${n} for ${h} days and watch the health factor daily (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Deleverage a little each week for 8 weeks to keep the health factor safe (about ${g} a week, 8 weeks).`,
+  },
+  Restaking: {
+    entry: (n, c, a, g) =>
+      `Restake ${a} through ${n} on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} restaked with ${n} for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Claim and restake the rewards once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+  'Staking Pool': {
+    entry: (n, c, a, g) =>
+      `Stake ${a} with ${n}'s pool on ${c} to open the wallet (${g}, about 10 minutes).`,
+    core: (n, _c, a, g, h) =>
+      `Keep ${a} staked with ${n}'s pool for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+    repeat: (n, _c, _s, g) =>
+      `Claim and re-stake the rewards once a week for 8 weeks (about ${g} a week, 8 weeks).`,
+  },
+};
+
+const DEFAULT_FAMILY: Family = {
+  entry: (n, c, a, g) =>
+    `Use ${n} on ${c} with ${a} to open the wallet (${g}, about 10 minutes).`,
+  core: (n, c, a, g, h) =>
+    `Keep ${a} working in ${n} on ${c} for ${h} days (${g} to enter, ${g} to exit, ${h} days).`,
+  repeat: (n, _c, _s, g) =>
+    `Do one action on ${n} every week for 8 weeks so the wallet stays active (about ${g} a week, 8 weeks).`,
+};
+
+function familyFor(category: string | null): Family {
+  if (category !== null && category in FAMILIES) return FAMILIES[category];
+  return DEFAULT_FAMILY;
+}
+
+// The risk step reads the protocol's own seven-day change: a rising
+// protocol is scaled into, a falling one is held small until the trend
+// turns, and no change reported means starting at the base size.
+function riskStep(
+  name: string,
+  change7d: number | null,
+  amount: string,
+  small: string,
+  gas: string,
+): string {
+  if (change7d === null || change7d === undefined) {
+    return `No 7-day change is reported for ${name}, so start at ${amount} and re-check the trend in 30 days before adding more (no extra cost, 30 days).`;
   }
-  return h;
+  if (change7d > 10) {
+    return `TVL rose ${formatPct(change7d)} in 7 days, so add ${small} more in two tranches over 14 days instead of all at once (about ${gas} gas, 14 days).`;
+  }
+  if (change7d > 0) {
+    return `TVL is up ${formatPct(change7d)} in 7 days; add ${small} after 14 days if the rise holds (about ${gas} gas, 14 days).`;
+  }
+  if (change7d > -10) {
+    return `TVL slipped ${formatPct(change7d)} in 7 days, so hold at ${amount} and re-check in 14 days before adding more (no extra cost, 14 days).`;
+  }
+  return `TVL fell ${formatPct(change7d)} in 7 days. Keep the position small at ${amount} and only add more after two straight weeks of growth (no extra cost, 14 days).`;
 }
 
-interface StepCtx {
-  name: string;
-  chain: string;
-  amt: string;
-  amt2: string;
-  gas: string;
+// The staying step reads the protocol's age: the longer it has run with no
+// token, the longer the reader should stay in.
+function stayStep(name: string, years: number): string {
+  const age = formatAge(years);
+  if (years < 1) {
+    return `${name} has run ${age} with no token. Leave the position untouched for 30 days, since early airdrops usually reward wallets that stay (no extra cost, 30 days).`;
+  }
+  if (years < 2) {
+    return `${name} has run ${age} with no token. Keep the position open for at least 45 days and do not withdraw before then (no extra cost, 45 days).`;
+  }
+  if (years < 4) {
+    return `${name} has run ${age} with no token. Keep the position open for at least 60 days; long-running protocols reward patience (no extra cost, 60 days).`;
+  }
+  return `${name} has run ${age} with no token. Keep the position open for at least 90 days; it has outlasted most of the field (no extra cost, 90 days).`;
 }
 
-type StepFn = (c: StepCtx) => string;
-
-function bandOf(tvl: number): { amt: string; amt2: string } {
-  if (tvl >= 1_000_000_000) return { amt: '$1,000–$5,000', amt2: '$500–$1,000' };
-  if (tvl >= 250_000_000) return { amt: '$300–$1,000', amt2: '$150–$300' };
-  if (tvl >= 100_000_000) return { amt: '$100–$300', amt2: '$50–$100' };
-  return { amt: '$50–$150', amt2: '$25–$50' };
-}
-
-function gasFor(chain: string): string {
-  const cheapL2 = new Set([
-    'Arbitrum', 'Optimism', 'Base', 'zkSync Era', 'Unichain', 'Ink', 'Mode',
-    'Blast', 'Linea', 'Scroll', 'Mantle', 'Polygon', 'Polygon zkEVM', 'Starknet',
-    'Soneium', 'Taiko', 'Zircuit', 'Morph', 'Manta', 'Fraxtal', 'Abstract',
-  ]);
-  if (chain === 'Ethereum') return '$8–$25';
-  if (chain === 'Solana') return 'about $0.01';
-  if (chain === 'Bitcoin') return '$2–$10';
-  if (cheapL2.has(chain)) return '$0.10–$1';
-  if (chain === 'Binance' || chain === 'Tron' || chain === 'Avalanche' || chain === 'BSC') return '$0.20–$1';
-  return '$0.50–$3';
-}
-
-// Every step ends in a parenthetical with its cost and time, which the
-// dashboard lifts out as a chip. Steps are self-contained: any five of a
-// family's list, in any rotation, still read as one plan.
-const LIBRARY: Record<string, StepFn[]> = {
-  dex: [
-    (c) => `Bridge ${c.amt} of USDC to ${c.chain} and swap half into the pool's second asset on ${c.name} (${c.gas} gas, 10–20 min).`,
-    (c) => `Add ${c.amt} of paired liquidity to ${c.name}'s deepest pool on ${c.chain} and hold the LP token for the snapshot (${c.gas} gas, 5–10 min).`,
-    (c) => `Stake the LP token in ${c.name}'s farm or gauge contract and leave it for at least two weekly epochs (${c.gas} gas, 5 min).`,
-    (c) => `Route a ${c.amt2} swap through ${c.name} on ${c.chain} every week to build routed volume on the same wallet (${c.gas} per swap, 2 min).`,
-    (c) => `Keep ${c.amt} of LP exposure on ${c.name} through the next snapshot date so the position is counted twice (no gas, 5 min to check).`,
-    (c) => `Register the farming wallet in ${c.name}'s points program and check the points balance weekly (no gas, 2 min).`,
-    (c) => `Watch ${c.name}'s announcements every Friday for a token date; a launch usually opens a 2–4 week claim window (no gas, 5 min).`,
-    (c) => `If you need funds back, withdraw in two ${c.amt2} tranches and keep one LP position open so the wallet still qualifies (${c.gas} gas per exit, 5–10 min).`,
-  ],
-  lending: [
-    (c) => `Deposit ${c.amt} of USDC as collateral on ${c.name} on ${c.chain} and borrow no more than 50% of its value (${c.gas} gas, 10–15 min).`,
-    (c) => `Supply ${c.amt} of ETH or wstETH to ${c.name}'s ${c.chain} market and leave it supplied for at least 30 days (${c.gas} gas, 5–10 min).`,
-    (c) => `Open a ${c.amt2} borrow against the deposit, swap it to USDC, and repay within 14 days to keep interest under $5 (${c.gas} gas per leg, 5 min).`,
-    (c) => `Keep the health factor above 2.0 on ${c.name} and top up collateral if it slips below 1.8 (no gas to check, 5 min).`,
-    (c) => `Repay the borrow in full before any snapshot so the wallet shows a clean supplied balance (${c.gas} gas, 5 min).`,
-    (c) => `Register the lending wallet in ${c.name}'s points program and confirm the supplied balance counts weekly (no gas, 2 min).`,
-    (c) => `Set a price alert on the collateral asset at 15% below your entry so you can top up before liquidation (no gas, 5 min).`,
-    (c) => `Withdraw in two ${c.amt2} tranches after 30 days, leaving a small supplied balance so the wallet stays active (${c.gas} gas per exit, 5–10 min).`,
-  ],
-  yield: [
-    (c) => `Deposit ${c.amt} of USDC into ${c.name}'s top vault on ${c.chain} and hold the vault share token (${c.gas} gas, 10–15 min).`,
-    (c) => `Split the deposit across two of ${c.name}'s vaults — ${c.amt2} in each — so one vault's snapshot still catches the wallet (${c.gas} gas per deposit, 5 min).`,
-    (c) => `Compound the vault yield back into the same vault once a month; each compound costs about ${c.gas} in gas (10 min).`,
-    (c) => `Hold the vault shares for at least 60 days so the position appears in two monthly snapshots (no gas, 5 min to check).`,
-    (c) => `Track ${c.name}'s vault APY weekly and move ${c.amt2} to the higher-yield vault if the gap stays above 2 points for two weeks (${c.gas} gas, 10 min).`,
-    (c) => `Register the vault wallet in ${c.name}'s points program and confirm the shares count weekly (no gas, 2 min).`,
-    (c) => `Keep a ${c.amt2} reserve of USDC on ${c.chain} so you can top up the vault without bridging again (${c.gas} gas to move, 5 min).`,
-    (c) => `Exit in two ${c.amt2} tranches after the second snapshot, keeping a small share balance so the wallet stays eligible (${c.gas} gas per exit, 5–10 min).`,
-  ],
-  bridge: [
-    (c) => `Bridge ${c.amt} of USDC from Ethereum to ${c.chain} through ${c.name} and keep the receipt hash (${c.gas} gas, 10–20 min).`,
-    (c) => `Bridge ${c.amt2} back the other way a week later so the wallet shows two-way volume on ${c.name} (${c.gas} gas, 10–20 min).`,
-    (c) => `Make one ${c.amt2} bridge a week for four weeks on ${c.name} to build a steady volume history (${c.gas} gas per bridge, 10 min each).`,
-    (c) => `Use ${c.name} to move ${c.amt} of ETH to ${c.chain} and leave it there for 30 days before bridging back (${c.gas} gas, 10–20 min).`,
-    (c) => `Bridge a small ${c.amt2} test amount first, confirm it arrives on ${c.chain}, then send the remaining ${c.amt} (${c.gas} gas, 15–25 min total).`,
-    (c) => `Register the bridging wallet in ${c.name}'s points program and confirm each bridge is counted (no gas, 2 min).`,
-    (c) => `Keep the bridged funds on ${c.chain} for at least 30 days so the destination balance is visible at snapshot time (no gas, 5 min to check).`,
-    (c) => `Check ${c.name}'s fee quote before each bridge and skip the week if the fee is above $25 (${c.gas} gas, 2 min to check).`,
-  ],
-  rwa: [
-    (c) => `Mint ${c.amt} of ${c.name}'s tokenized asset on ${c.chain} with USDC and hold the receipt token (${c.gas} gas, 10–20 min).`,
-    (c) => `Deposit ${c.amt2} of the tokenized asset into ${c.name}'s vault or lending market for at least 30 days (${c.gas} gas, 5–10 min).`,
-    (c) => `Hold ${c.amt} of the asset through the next monthly attestation so the balance is on record (no gas, 5 min to check).`,
-    (c) => `Split the position into two wallets of ${c.amt2} each only if you already use both; never create wallets just for the airdrop (${c.gas} gas per move, 5 min).`,
-    (c) => `Check ${c.name}'s proof-of-reserves page weekly and note the attestation date in your calendar (no gas, 5 min).`,
-    (c) => `Register the holding wallet in ${c.name}'s points program and confirm the balance counts weekly (no gas, 2 min).`,
-    (c) => `Redeem ${c.amt2} after 30 days to test the redemption path, then re-mint if the process is smooth (${c.gas} gas per leg, 10–20 min).`,
-    (c) => `Keep a ${c.amt2} position open after any redemption so the wallet still shows exposure at snapshot time (${c.gas} gas, 5 min).`,
-  ],
-  lstaking: [
-    (c) => `Stake ${c.amt} of ETH through ${c.name} on ${c.chain} and hold the liquid staking token (${c.gas} gas, 10–15 min).`,
-    (c) => `Use ${c.amt2} of the staking token as collateral in a ${c.chain} lending market and keep the loan below 40% (${c.gas} gas, 5–10 min).`,
-    (c) => `Hold the staking token for at least 60 days so the position appears in two snapshots (no gas, 5 min to check).`,
-    (c) => `Restake ${c.amt2} of the staking token in a restaking vault if ${c.name} supports it, and note the unbonding time (${c.gas} gas, 10 min).`,
-    (c) => `Add ${c.amt2} of the staking token to a ${c.chain} DEX pool to earn trading fees on top of staking yield (${c.gas} gas, 5–10 min).`,
-    (c) => `Register the staking wallet in ${c.name}'s points program and confirm the stake counts weekly (no gas, 2 min).`,
-    (c) => `Check the staking token's peg to ETH weekly; unstake if it trades more than 2% below peg for a week (${c.gas} gas, 10 min).`,
-    (c) => `Unstake in two ${c.amt2} tranches after the second snapshot, keeping a small stake so the wallet stays eligible (${c.gas} gas per exit, 5–10 min).`,
-  ],
-  restaking: [
-    (c) => `Restake ${c.amt} of staked ETH through ${c.name} on ${c.chain} and hold the restaked token (${c.gas} gas, 10–20 min).`,
-    (c) => `Delegate the restaked position to two different operators with ${c.amt2} each to spread slashing risk (${c.gas} gas, 5–10 min).`,
-    (c) => `Hold the restaked token for at least 60 days so it appears in two snapshots (no gas, 5 min to check).`,
-    (c) => `Use ${c.amt2} of the restaked token in a ${c.chain} lending market at under 40% loan-to-value (${c.gas} gas, 5–10 min).`,
-    (c) => `Check ${c.name}'s operator slashing history monthly and redelegate if an operator is slashed (${c.gas} gas, 10 min).`,
-    (c) => `Register the restaking wallet in ${c.name}'s points program and confirm the position counts weekly (no gas, 2 min).`,
-    (c) => `Note ${c.name}'s unbonding period (often 7–14 days) and start any exit at least two weeks before you need the funds (${c.gas} gas, 5 min).`,
-    (c) => `Exit in two ${c.amt2} tranches after the second snapshot, keeping a small restaked balance so the wallet stays eligible (${c.gas} gas per exit, 5–10 min).`,
-  ],
-  perps: [
-    (c) => `Open a ${c.amt2} long or short on ${c.name}'s ${c.chain} perps market with at most 2x leverage and a stop loss (${c.gas} gas, 5–10 min).`,
-    (c) => `Place one ${c.amt2} trade a week on ${c.name} for four weeks to build a steady trading history (${c.gas} gas per trade, 5 min).`,
-    (c) => `Provide ${c.amt} of liquidity to ${c.name}'s vault or insurance fund on ${c.chain} for at least 30 days (${c.gas} gas, 5–10 min).`,
-    (c) => `Keep every position under 2x leverage and never risk more than ${c.amt2} on a single trade (no gas, 5 min to check).`,
-    (c) => `Set a stop loss 5% from entry on every ${c.name} trade so one move cannot wipe the farming wallet (${c.gas} gas, 2 min).`,
-    (c) => `Register the trading wallet in ${c.name}'s points program and confirm the volume counts weekly (no gas, 2 min).`,
-    (c) => `Close each position after 7–14 days and bank the result before opening the next one (${c.gas} gas, 5 min).`,
-    (c) => `Keep a ${c.amt2} vault deposit open after any trade closes so the wallet still shows exposure (${c.gas} gas, 5 min).`,
-  ],
-  gaming: [
-    (c) => `Play ${c.name} on ${c.chain} for at least 30 minutes a week for four weeks and keep the same wallet connected (${c.gas} gas to start, 30 min a session).`,
-    (c) => `Buy a ${c.amt2} starter item or pass on ${c.name} and hold it for at least 30 days (${c.gas} gas, 5–10 min).`,
-    (c) => `Complete ${c.name}'s weekly quests with the farming wallet and claim the rewards each week (no gas, 15 min a week).`,
-    (c) => `Hold ${c.amt2} of ${c.name}'s in-game currency on ${c.chain} through the next snapshot (no gas, 5 min to check).`,
-    (c) => `Join ${c.name}'s seasonal event and finish at least three event tasks before it ends (${c.gas} gas, 30 min).`,
-    (c) => `Register the gaming wallet in ${c.name}'s points program and confirm the activity counts weekly (no gas, 2 min).`,
-    (c) => `Trade one ${c.amt2} item on ${c.name}'s marketplace to show marketplace volume on the wallet (${c.gas} gas, 5–10 min).`,
-    (c) => `Keep the starter item listed or staked after the season ends so the wallet still shows a position (${c.gas} gas, 5 min).`,
-  ],
-  payments: [
-    (c) => `Load ${c.amt} of USDC onto ${c.name}'s card or account on ${c.chain} and spend ${c.amt2} a week on everyday purchases (${c.gas} gas to load, 5 min).`,
-    (c) => `Pay a ${c.amt2} bill or subscription through ${c.name} each month for three months (${c.gas} gas per payment, 5 min).`,
-    (c) => `Hold a ${c.amt2} balance on ${c.name} for at least 30 days so the account shows a steady balance (no gas, 5 min to check).`,
-    (c) => `Use ${c.name} for one cross-border payment of ${c.amt2} and keep the receipt (${c.gas} gas, 10 min).`,
-    (c) => `Enable ${c.name}'s cashback or rewards and confirm the first reward lands within a week (no gas, 5 min).`,
-    (c) => `Register the payment wallet in ${c.name}'s points program and confirm the spending counts weekly (no gas, 2 min).`,
-    (c) => `Keep the card active with a ${c.amt2} purchase every week so the account never goes dormant (${c.gas} gas, 2 min).`,
-    (c) => `Withdraw ${c.amt2} to your bank after 30 days to test the off-ramp, then reload if it works smoothly (${c.gas} gas, 10–15 min).`,
-  ],
-  cex: [
-    (c) => `Create and verify an account on ${c.name}, enable two-factor authentication, and deposit ${c.amt} of USDC (${c.gas} gas to move funds, 15–30 min).`,
-    (c) => `Hold ${c.amt} of assets on ${c.name} for at least 30 days so the balance is visible at snapshot time (no gas, 5 min to check).`,
-    (c) => `Use ${c.amt2} of the deposit in ${c.name}'s earn or staking product for 30 days and note the unlock date (${c.gas} gas, 5–10 min).`,
-    (c) => `Place one ${c.amt2} spot trade a week on ${c.name} for four weeks to build a steady trading history (no gas, 5 min a trade).`,
-    (c) => `Keep a ${c.amt2} balance in the earn product after any trade so the account still shows a position (no gas, 5 min).`,
-    (c) => `Register the account in ${c.name}'s points or rewards program and confirm the balance counts weekly (no gas, 2 min).`,
-    (c) => `Set a withdrawal whitelist address and test a ${c.amt2} withdrawal to confirm the account is fully working (${c.gas} gas, 10–15 min).`,
-    (c) => `Watch ${c.name}'s announcements every Friday for a token date; a launch usually opens a 2–4 week claim window (no gas, 5 min).`,
-  ],
-  curator: [
-    (c) => `Deposit ${c.amt} of USDC into a curated vault on ${c.name} on ${c.chain} and hold the vault share token (${c.gas} gas, 10–15 min).`,
-    (c) => `Compare the curator's past 90-day returns on ${c.name} and pick a vault with no missed rebalances (${c.gas} gas, 10 min to research).`,
-    (c) => `Split the deposit across two curators on ${c.name} — ${c.amt2} each — so one vault's snapshot still catches the wallet (${c.gas} gas per deposit, 5 min).`,
-    (c) => `Hold the vault shares for at least 60 days so the position appears in two snapshots (no gas, 5 min to check).`,
-    (c) => `Check the vault's allocation weekly and exit if the curator moves more than half the funds in one rebalance (${c.gas} gas, 5 min).`,
-    (c) => `Register the vault wallet in ${c.name}'s points program and confirm the shares count weekly (no gas, 2 min).`,
-    (c) => `Keep a ${c.amt2} reserve of USDC on ${c.chain} so you can top up the vault without bridging again (${c.gas} gas to move, 5 min).`,
-    (c) => `Exit in two ${c.amt2} tranches after the second snapshot, keeping a small share balance so the wallet stays eligible (${c.gas} gas per exit, 5–10 min).`,
-  ],
-  chain: [
-    (c) => `Bridge ${c.amt} of USDC to ${c.chain} and use it in two of the chain's largest apps within a week (${c.gas} gas, 15–25 min).`,
-    (c) => `Stake ${c.amt2} of the chain's native token through ${c.name}'s staking and hold it for at least 60 days (${c.gas} gas, 5–10 min).`,
-    (c) => `Make one ${c.amt2} transaction a week on ${c.chain} for four weeks to build an active-address history (${c.gas} gas per transaction, 5 min).`,
-    (c) => `Use ${c.amt2} in a ${c.chain} DEX pool and hold the LP token for at least 30 days (${c.gas} gas, 5–10 min).`,
-    (c) => `Register the wallet in ${c.name}'s points program and confirm the activity counts weekly (no gas, 2 min).`,
-    (c) => `Keep ${c.amt2} of native token staked after any other position closes so the wallet still shows exposure (${c.gas} gas, 5 min).`,
-    (c) => `Check ${c.name}'s validator or staking dashboard monthly and redelegate if your validator misses blocks (${c.gas} gas, 10 min).`,
-    (c) => `Bridge ${c.amt2} back to Ethereum after 60 days to test the exit path, then return if it works smoothly (${c.gas} gas, 10–20 min).`,
-  ],
-  generic: [
-    (c) => `Put ${c.amt} to work in ${c.name}'s main product on ${c.chain} and hold the position for at least 30 days (${c.gas} gas, 10–15 min).`,
-    (c) => `Add ${c.amt2} more after a week so the wallet shows a growing position on ${c.name} (${c.gas} gas, 5–10 min).`,
-    (c) => `Hold the position through the next two weekly snapshots so it is counted twice (no gas, 5 min to check).`,
-    (c) => `Use ${c.name} once a week for four weeks with ${c.amt2} each time to build a steady usage history (${c.gas} gas per use, 5 min).`,
-    (c) => `Register the wallet in ${c.name}'s points program and confirm the activity counts weekly (no gas, 2 min).`,
-    (c) => `Keep a ${c.amt2} position open after any partial exit so the wallet still shows exposure (${c.gas} gas, 5 min).`,
-    (c) => `Watch ${c.name}'s announcements every Friday for a token date; a launch usually opens a 2–4 week claim window (no gas, 5 min).`,
-    (c) => `Withdraw in two ${c.amt2} tranches after the second snapshot if you need the funds (${c.gas} gas per exit, 5–10 min).`,
-  ],
-};
-
-const FAMILY_OF: Record<string, string> = {
-  Dexs: 'dex', 'Liquidity Manager': 'dex', Farm: 'dex',
-  Lending: 'lending', 'Uncollateralized Lending': 'lending', CDP: 'lending',
-  'CDP Manager': 'lending', 'Collateral Markets': 'lending', 'Leveraged Farming': 'lending',
-  Yield: 'yield', 'Yield Aggregator': 'yield', 'Basis Trading': 'yield',
-  'Onchain Capital Allocator': 'yield', 'Governance Incentives': 'yield',
-  Bridge: 'bridge', 'Canonical Bridge': 'bridge', 'Cross Chain Bridge': 'bridge',
-  RWA: 'rwa', 'Anchor BTC': 'rwa', 'Decentralized BTC': 'rwa', 'Restaked BTC': 'rwa',
-  'Dual-Token Stablecoin': 'rwa', 'Stablecoin Wrapper': 'rwa',
-  'Liquid Staking': 'lstaking', 'Staking Pool': 'lstaking',
-  Restaking: 'restaking', 'Liquid Restaking': 'restaking',
-  Derivatives: 'perps', 'Interest Rate Derivatives': 'perps', 'Options Vault': 'perps',
-  'Prediction Market': 'perps',
-  Payments: 'payments', 'Crypto Card Issuer': 'payments',
-  CEX: 'cex', CeDeFi: 'cex', 'OTC Marketplace': 'cex',
-  'Risk Curators': 'curator',
-  Chain: 'chain',
-};
-
-/** Exactly five concrete steps for one protocol, picked by its slug's hash. */
-export function farmSteps(p: SnapshotProtocol): string[] {
-  const family = FAMILY_OF[p.category ?? ''] ?? 'generic';
-  const fns = LIBRARY[family] ?? LIBRARY['generic']!;
-  const chain = (p.chains ?? [])[0] ?? 'its main chain';
-  const band = bandOf(p.tvl_usd);
-  const ctx: StepCtx = {
-    name: p.name,
-    chain,
-    amt: band.amt,
-    amt2: band.amt2,
-    gas: gasFor(chain),
-  };
-  const start = hashSlug(p.slug) % fns.length;
-  const steps: string[] = [];
-  for (let i = 0; i < 5; i++) steps.push(fns[(start + i) % fns.length]!(ctx));
+// Five steps per protocol, each naming the protocol, its chain and concrete
+// amounts, costs and durations. Every step ends with a cost and a duration
+// in brackets, which the dashboard lifts out as a chip.
+export function farmStepsFor(row: RankedRow): string[] {
+  const amount = positionSize(row.tvl_usd);
+  const amountStr = formatMoney(amount);
+  const smallStr = formatMoney(topUp(amount));
+  const gas = formatGasAmount(row.chain);
+  const gasShort = gasOn(row.chain);
+  const hold = holdDays(row.age_years);
+  const family = familyFor(row.category);
+  const steps = [
+    family.entry(row.name, row.chain, amountStr, gas),
+    family.core(row.name, row.chain, amountStr, gasShort, hold),
+    family.repeat(row.name, row.chain, smallStr, gasShort),
+    riskStep(row.name, row.change_7d, amountStr, smallStr, gasShort),
+    stayStep(row.name, row.age_years),
+  ];
+  for (const step of steps) {
+    const trimmed = step.trim();
+    if (trimmed.length < 20 || trimmed.length > 600) {
+      throw new Error(
+        'Farm step out of range for ' + row.slug + ': ' + trimmed.length,
+      );
+    }
+  }
   return steps;
 }
 
 // ---------------------------------------------------------------- the board
 
-/** Score one protocol: its multipliers, its implied value, its farm plan. */
-export function score(p: SnapshotProtocol, asOf: string): ScoredProtocol {
-  const m = multipliers(p, asOf);
-  const pre = isPreToken(p);
-  return {
-    slug: p.slug,
-    name: p.name,
-    category: p.category,
-    chains: p.chains ?? [],
-    tvl: p.tvl_usd,
-    change7d: p.change_7d,
-    ageYears: m.ageYears,
-    growthMult: m.growthMult,
-    ageMult: m.ageMult,
-    chainMult: m.chainMult,
-    implied: m.implied,
-    farmSteps: pre && setAsideReason(p) === null ? farmSteps(p) : [],
-    preToken: pre,
-    setAside: setAsideReason(p),
-    mcap: p.mcap_usd,
-    symbol: p.symbol,
-  };
+// One line a reader can check: why this protocol sits at its rank, in the
+// snapshot's own numbers. The implied value, the TVL, the seven-day move
+// and the age are all stated, so the rank never looks arbitrary.
+export function rankLine(row: RankedRow): string {
+  const growth =
+    row.change_7d === null || row.change_7d === undefined
+      ? 'no 7-day change reported'
+      : row.change_7d > 0
+        ? 'up ' + formatPct(row.change_7d) + ' in 7 days'
+        : row.change_7d < 0
+          ? 'down ' + formatPct(row.change_7d) + ' in 7 days'
+          : 'flat over 7 days';
+  const age =
+    row.listed_at === null
+      ? 'no start date recorded'
+      : 'tracked for ' + formatAge(row.age_years);
+  return (
+    'Rank ' +
+    row.rank +
+    ' of the launch candidates: ' +
+    formatUsd(row.implied_value_usd) +
+    ' implied from ' +
+    formatUsd(row.tvl_usd) +
+    ' of TVL, ' +
+    growth +
+    ', ' +
+    age +
+    '.'
+  );
 }
 
-/**
- * Rank every launch candidate by implied value, ties by TVL then slug.
- * Ranks run exactly 1..N and implied never rises with rank. Every watchlist
- * slug must be on the board; a missing one is a loud failure, not a skip.
- * Pre-token protocols the rule sets aside are returned separately, with
- * their reason, so the page can show them instead of hiding them.
- */
-export function buildBoard(snapshot: Snapshot): BuiltBoard {
-  const asOf = snapshot.as_of;
-  const scored = snapshot.protocols.map((p) => score(p, asOf));
-  const pre = scored
-    .filter((s) => s.preToken && s.setAside === null)
-    .sort((a, b) => {
-      if (b.implied !== a.implied) return b.implied - a.implied;
-      if (b.tvl !== a.tvl) return b.tvl - a.tvl;
-      return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
-    });
-  const setAside = scored
-    .filter((s) => s.preToken && s.setAside !== null)
-    .sort((a, b) => b.tvl - a.tvl || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
-    .map((s) => ({
-      slug: s.slug,
-      name: s.name,
-      category: s.category,
-      tvl: s.tvl,
-      reason: s.setAside as string,
-    }));
-  const live = scored
-    .filter((s) => !s.preToken)
-    .sort((a, b) => {
-      const ma = a.mcap ?? -1;
-      const mb = b.mcap ?? -1;
-      if (mb !== ma) return mb - ma;
-      return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
-    });
-  const rows: BoardRow[] = pre.map((s, i) => ({
-    slug: s.slug,
-    name: s.name,
-    rank: i + 1,
-    implied_value_usd: s.implied,
-    farm_steps: s.farmSteps,
-  }));
-  const onBoard = new Set(rows.map((r) => r.slug));
-  for (const slug of snapshot.watchlist) {
-    if (!onBoard.has(slug)) {
-      throw new Error(`buildBoard: watchlist slug ${slug} is not pre-token or not in the snapshot`);
-    }
+function topEntries(
+  rows: RankedRow[],
+  key: (r: RankedRow) => string,
+  limit: number,
+): BreakdownEntry[] {
+  const totals = new Map<string, { total: number; count: number }>();
+  for (const row of rows) {
+    const k = key(row);
+    const slot = totals.get(k) ?? { total: 0, count: 0 };
+    slot.total += row.implied_value_usd;
+    slot.count += 1;
+    totals.set(k, slot);
   }
+  return [...totals.entries()]
+    .map(([k, v]) => ({ key: k, total: v.total, count: v.count }))
+    .sort((a, b) => b.total - a.total || a.key.localeCompare(b.key))
+    .slice(0, limit);
+}
+
+// Build the board from the snapshot: rank the launch candidates by implied
+// value, set the rest of the pre-token protocols aside with their reason,
+// and list the protocols whose token already trades separately.
+export function buildBoard(snapshot: Snapshot): Board {
+  const asOf = snapshot.as_of;
+  const ranked: RankedRow[] = [];
+  const setAside: SetAsideRow[] = [];
+  const tokenTrading: TokenRow[] = [];
+  for (const p of snapshot.protocols) {
+    if (!recordsNoToken(p)) {
+      tokenTrading.push({
+        slug: p.slug,
+        name: p.name,
+        category: p.category,
+        tvl_usd: p.tvl_usd,
+        change_7d: p.change_7d,
+        chains: p.chains.length,
+      });
+      continue;
+    }
+    const reason = setAsideReason(p);
+    if (reason !== null) {
+      setAside.push({
+        slug: p.slug,
+        name: p.name,
+        category: p.category,
+        tvl_usd: p.tvl_usd,
+        reason,
+      });
+      continue;
+    }
+    const years = ageYears(p.listed_at, asOf);
+    const row: RankedRow = {
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chain: p.chains[0] ?? 'Unknown',
+      chains: p.chains.length,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      listed_at: p.listed_at,
+      age_years: years,
+      growth_mult: growthMult(p.change_7d),
+      age_mult: ageMult(years),
+      chain_mult: chainMult(p.chains.length),
+      implied_value_usd: impliedValue(p, asOf),
+      rank: 0,
+      farm_steps: [],
+    };
+    ranked.push(row);
+  }
+  // Highest implied value first; a tie breaks on the slug so the order is
+  // the same on every run.
+  ranked.sort(
+    (a, b) =>
+      b.implied_value_usd - a.implied_value_usd ||
+      (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0),
+  );
+  for (let i = 0; i < ranked.length; i++) {
+    ranked[i].rank = i + 1;
+    ranked[i].farm_steps = farmStepsFor(ranked[i]);
+  }
+  tokenTrading.sort((a, b) => b.tvl_usd - a.tvl_usd);
+  setAside.sort((a, b) => b.tvl_usd - a.tvl_usd);
+  const totalImplied = ranked.reduce(
+    (sum, row) => sum + row.implied_value_usd,
+    0,
+  );
   return {
     asOf,
     floorUsd: snapshot.floor_usd,
-    watchlist: [...snapshot.watchlist],
-    rows,
-    scored: pre,
-    live,
+    ranked,
     setAside,
+    tokenTrading,
+    chains: topEntries(ranked, (r) => r.chain, 5),
+    categories: topEntries(
+      ranked,
+      (r) => r.category ?? 'Uncategorised',
+      5,
+    ),
+    totalImplied,
   };
-}
-
-/** The gate's shape, checked before anything is written. Returns error strings. */
-export function validateBoard(rows: BoardRow[], watchlist: string[]): string[] {
-  const errors: string[] = [];
-  const seen = new Set<string>();
-  let prevImplied = Number.POSITIVE_INFINITY;
-  rows.forEach((r, i) => {
-    if (r.rank !== i + 1) errors.push(`row ${r.slug}: rank ${r.rank}, expected ${i + 1}`);
-    if (seen.has(r.slug)) errors.push(`row ${r.slug}: slug twice`);
-    seen.add(r.slug);
-    if (!Number.isInteger(r.implied_value_usd) || r.implied_value_usd < 1) {
-      errors.push(`row ${r.slug}: implied ${r.implied_value_usd} is not a positive whole number`);
-    }
-    if (r.implied_value_usd > prevImplied) errors.push(`row ${r.slug}: implied rises with rank`);
-    prevImplied = r.implied_value_usd;
-    if (!Array.isArray(r.farm_steps) || r.farm_steps.length < 3 || r.farm_steps.length > 12) {
-      errors.push(`row ${r.slug}: ${r.farm_steps?.length ?? 0} farm steps, need 3–12`);
-    } else {
-      r.farm_steps.forEach((s, j) => {
-        const t = s.trim();
-        if (t.length < 20 || t.length > 600) {
-          errors.push(`row ${r.slug} step ${j + 1}: ${t.length} chars, need 20–600`);
-        }
-      });
-    }
-  });
-  for (const slug of watchlist) {
-    if (!seen.has(slug)) errors.push(`watchlist slug ${slug} is missing from the board`);
-  }
-  return errors;
 }

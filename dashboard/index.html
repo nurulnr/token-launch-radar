@@ -1,114 +1,144 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Radar Zero — every launch candidate, ranked</title>
+<title>Radar Zero — Token Launch Radar</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<header class="mast">
-  <div class="mast-top">
+<header class="masthead">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true"><span class="sweep"></span></div>
     <div>
-      <h1>RADAR <span>ZERO</span></h1>
-      <p class="tag">Every launch candidate, ranked by implied value</p>
+      <h1>Radar Zero</h1>
+      <p class="tagline">Every launch candidate, ranked by implied value.</p>
     </div>
-    <div class="mast-meta" id="snapshotLine">Snapshot loading…</div>
   </div>
-  <div class="ticker" id="ticker"></div>
+  <div class="masthead-meta">
+    <span>Snapshot 14 Nov 2026</span>
+    <span>Source DefiLlama</span>
+    <span id="meta-counts">199 launch candidates</span>
+  </div>
 </header>
 
 <main>
-  <section id="scope" class="scope">
-    <div class="radar-wrap">
-      <canvas id="radar" width="360" height="360"></canvas>
-      <p class="legend">Angle = 7d growth &nbsp;·&nbsp; distance = TVL, log scale &nbsp;·&nbsp; blip size = implied value &nbsp;·&nbsp; amber = top 10</p>
-    </div>
-    <aside class="side">
-      <h2>TOP 10 BY IMPLIED VALUE</h2>
-      <ol id="top10" class="top10"></ol>
-      <dl class="stats" id="stats"></dl>
-    </aside>
-  </section>
-
-  <section id="detail" class="detail" hidden></section>
-
-  <section class="controls" id="controls">
-    <input id="q" type="search" placeholder="Search name or slug…" aria-label="Search name or slug">
-    <select id="fStatus" aria-label="Status">
-      <option value="pretoken">Pre-token</option>
-      <option value="live">Token trades</option>
-      <option value="all">All</option>
-    </select>
-    <select id="fCategory" aria-label="Category"></select>
-    <select id="fChain" aria-label="Chain"></select>
-    <select id="fTvl" aria-label="Minimum TVL">
-      <option value="0">Any TVL</option>
-      <option value="50000000">TVL ≥ $50M</option>
-      <option value="100000000">TVL ≥ $100M</option>
-      <option value="500000000">TVL ≥ $500M</option>
-      <option value="1000000000">TVL ≥ $1B</option>
-    </select>
-    <select id="fSort" aria-label="Sort">
-      <option value="rank">Sort: rank</option>
-      <option value="implied">Sort: implied value</option>
-      <option value="tvl">Sort: TVL</option>
-      <option value="growth">Sort: 7d growth</option>
-      <option value="age">Sort: age</option>
-    </select>
-    <p class="resultline" id="resultLine"></p>
-  </section>
-
-  <section id="boardWrap">
-    <table class="board" id="board">
-      <thead><tr>
-        <th class="num">Rank</th><th>Protocol</th><th class="num">TVL</th>
-        <th class="num">7d</th><th class="num">Age</th><th class="num">Implied value</th><th>Status</th>
-      </tr></thead>
-      <tbody id="boardBody"></tbody>
-    </table>
-  </section>
-
-  <section id="liveWrap" hidden>
-    <h2>TOKEN ALREADY TRADES</h2>
-    <p class="muted">These protocols have a token, so they are not ranked. Their market cap is shown for comparison — the board above is for what has not launched yet.</p>
-    <table class="board" id="liveTable">
-      <thead><tr>
-        <th>Protocol</th><th>Category</th><th class="num">TVL</th>
-        <th class="num">Market cap</th><th>Symbol</th><th>Status</th>
-      </tr></thead>
-      <tbody id="liveBody"></tbody>
-    </table>
-  </section>
-
-  <section id="setAsideWrap" hidden>
-    <h2>SET ASIDE — NOT RANKED</h2>
-    <p class="muted">These protocols record no token, but the watchlist rule keeps them off a launch board: exchanges, bridges, liquid-staking and wrapped or staked products of a token that already trades, and version forks. They are listed so the radar shows its work — the ranked board above is for genuine launch candidates only.</p>
-    <table class="board" id="setAsideTable">
-      <thead><tr>
-        <th>Protocol</th><th>Category</th><th class="num">TVL</th><th>Why set aside</th>
-      </tr></thead>
-      <tbody id="setAsideBody"></tbody>
-    </table>
-  </section>
-
-  <section class="method" id="method">
-    <h2>HOW THE VALUE IS WORKED OUT</h2>
-    <p>A protocol with no token yet is worth what its locked value would be worth if it had one. The implied value is the protocol's TVL times three small multipliers — nothing else, no hand-picked names, no hidden weights.</p>
-    <p>Only launch candidates are ranked: a protocol is set aside when it is an exchange, a bridge, a liquid-staking or restaked product, a wrapped or staked product of a token that already trades, or a version fork — the same rule the snapshot's own watchlist publishes, applied here without its $50M floor. Set-aside protocols are listed below the board with their reason.</p>
-    <div class="formula">implied = TVL × growth × age × chains</div>
+  <section class="model-strip" aria-label="How the value is worked out">
+    <h2>How the value is worked out</h2>
+    <p class="formula">Implied value = TVL &times; growth &times; age &times; chains</p>
     <ul class="factors">
-      <li><b>growth</b> — 1 + the 7-day TVL change, capped at −40% to +150%. A protocol growing fast is worth more than its TVL alone.</li>
-      <li><b>age</b> — 1 + 0.12 × years since listing, capped at 4 years. Older means it survived more than one cycle.</li>
-      <li><b>chains</b> — 1 + 0.04 × the number of chains, capped at 6. More chains means more reach.</li>
+      <li><strong>Growth</strong> — 1 + the 7-day TVL change, clamped to &minus;40% … +150%. No change reported counts as 1.</li>
+      <li><strong>Age</strong> — 1 + 0.12 &times; years tracked, up to 4 years. No start date on record counts as 0 years.</li>
+      <li><strong>Chains</strong> — 1 + 0.04 &times; chains live, up to 6. More chains, more reach.</li>
+      <li><strong>TVL</strong> — the base. Total value locked, as the snapshot reports it.</li>
     </ul>
-    <p id="workedExample" class="worked"></p>
-    <p class="code-note">The same formula runs in app.js as impliedValue(p) — read it there, next to the table code.</p>
+    <p class="worked" id="worked-example">Worked example loading.</p>
+    <p class="model-note">The implied value is this radar's own claim: what the token would be worth if the protocol's record stayed as it is. It is not a price, a prediction or investment advice. Every figure comes from the snapshot alone; no name list, no outside data.</p>
+  </section>
+
+  <section class="stats" aria-label="Board totals">
+    <div class="stat"><span class="stat-num" id="stat-ranked">199</span><span class="stat-label">Launch candidates</span></div>
+    <div class="stat"><span class="stat-num" id="stat-implied">—</span><span class="stat-label">Total implied value</span></div>
+    <div class="stat"><span class="stat-num" id="stat-setaside">143</span><span class="stat-label">Set aside</span></div>
+    <div class="stat"><span class="stat-num" id="stat-token">416</span><span class="stat-label">Token already trading</span></div>
+  </section>
+
+  <section class="panels">
+    <div class="panel radar-panel">
+      <h2>Radar plot</h2>
+      <p class="panel-note">Each dot is a launch candidate. Distance from the centre is implied value; angle is the protocol's age. The green ring marks the top 10.</p>
+      <canvas id="radar" width="520" height="520" role="img" aria-label="Radar plot of launch candidates by implied value and age"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Where the value sits</h2>
+      <h3>By chain</h3>
+      <ol class="breakdown" id="breakdown-chains"></ol>
+      <h3>By category</h3>
+      <ol class="breakdown" id="breakdown-categories"></ol>
+    </div>
+  </section>
+
+  <section class="controls" aria-label="Board controls">
+    <label>Search <input id="q" type="search" placeholder="Protocol name or slug" autocomplete="off"></label>
+    <label>Category
+      <select id="category">
+        <option value="">All categories</option>
+      </select>
+    </label>
+    <label>List
+      <select id="status">
+        <option value="pretoken">Launch candidates</option>
+        <option value="setaside">Set aside</option>
+        <option value="token">Token already trading</option>
+      </select>
+    </label>
+    <label>Sort
+      <select id="sort">
+        <option value="implied">Implied value, high first</option>
+        <option value="tvl">TVL, high first</option>
+        <option value="growth">7-day change, high first</option>
+        <option value="age">Age, oldest first</option>
+        <option value="name">Name, A to Z</option>
+      </select>
+    </label>
+    <p class="result-count" id="result-count"></p>
+  </section>
+
+  <section class="board-wrap" aria-label="The board">
+    <table class="board" id="board">
+      <thead>
+        <tr>
+          <th class="num">Rank</th>
+          <th>Protocol</th>
+          <th>Category</th>
+          <th>Chain</th>
+          <th class="num">TVL</th>
+          <th class="num">7d</th>
+          <th class="num">Age</th>
+          <th class="num">Implied</th>
+          <th class="factors-col">Why it ranks here</th>
+        </tr>
+      </thead>
+      <tbody id="board-body"></tbody>
+    </table>
+    <p class="board-hint">Click a row to open its detail and farm plan. The bars under each implied value show the four multipliers: growth, age, chains, TVL share.</p>
+  </section>
+
+  <section class="detail" id="detail" hidden aria-label="Protocol detail">
+    <div class="detail-head">
+      <h2 id="detail-name">—</h2>
+      <span class="detail-rank" id="detail-rank">—</span>
+      <button class="detail-close" id="detail-close" type="button">Close</button>
+    </div>
+    <p class="detail-line" id="detail-line"></p>
+    <div class="factor-bars" id="detail-factors"></div>
+    <h3>Farm plan — five steps</h3>
+    <ol class="farm" id="detail-farm"></ol>
+    <p class="detail-note">Costs are rough gas estimates for the protocol's main chain. The plan is a starting point, not advice; check the protocol's own docs before moving money.</p>
+  </section>
+
+  <section class="setaside" aria-label="Set aside">
+    <h2>Set aside — 143 protocols</h2>
+    <p class="panel-note">These records show no token of their own, but the house rule keeps them off the launch board: a centralised exchange, a bridge, or a wrapped, staked or restaked product of a token that already trades. They are listed here with the reason, not hidden.</p>
+    <table class="mini" id="setaside-table">
+      <thead><tr><th>Protocol</th><th>Category</th><th class="num">TVL</th><th>Reason</th></tr></thead>
+      <tbody id="setaside-body"></tbody>
+    </table>
+  </section>
+
+  <section class="token" aria-label="Token already trading">
+    <h2>Token already trading — 416 protocols</h2>
+    <p class="panel-note">These protocols already have a token that trades. They are not launch candidates, so they sit in their own table, ranked by TVL. Nothing here is ranked by implied value.</p>
+    <table class="mini" id="token-table">
+      <thead><tr><th>Protocol</th><th>Category</th><th class="num">TVL</th><th class="num">7d</th><th class="num">Chains</th></tr></thead>
+      <tbody id="token-body"></tbody>
+    </table>
   </section>
 </main>
 
 <footer>
-  <p>Radar Zero · snapshot 14 Nov 2026 · launch candidates only on the ranked board · farm steps are plans, not promises — check every contract address yourself before you send funds.</p>
+  <p>Radar Zero. Snapshot as of 14 Nov 2026, source DefiLlama, floor $50,000,000. 758 protocols read: 199 launch candidates, 143 set aside, 416 token already trading. The board is built from the snapshot alone; the snapshot itself is never edited.</p>
+  <p>Implied value is the entry's own claim about what a token could be worth. It is not a price, not a prediction, and not investment advice. Farm steps name rough costs in dollars; gas changes, so check before you act.</p>
 </footer>
 
 <script src="../data.js"></script>
